@@ -6,8 +6,10 @@ package adapter
 import (
 	"context"
 	"fmt"
+	"github.com/stretchr/testify/assert"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -115,6 +117,47 @@ func TestHandleConsumeRetry(t *testing.T) {
 		1*time.Second, 5*time.Millisecond, "one log entry expected",
 	)
 	require.NoError(t, logsReceiver.Shutdown(context.Background()))
+}
+
+func TestShutdownFlush(t *testing.T) {
+	mockConsumer := &consumertest.LogsSink{}
+	factory := NewFactory(TestReceiverType{}, component.StabilityLevelDevelopment)
+
+	logsReceiver, err := factory.CreateLogsReceiver(context.Background(), receivertest.NewNopCreateSettings(), factory.CreateDefaultConfig(), mockConsumer)
+	require.NoError(t, err, "receiver should successfully build")
+
+	err = logsReceiver.Start(context.Background(), componenttest.NewNopHost())
+	require.NoError(t, err, "receiver start failed")
+
+	var consumedLogCount atomic.Int32
+	closeCh := make(chan struct{})
+	stanzaReceiver := logsReceiver.(*receiver)
+	go func() {
+		for {
+			select {
+			case <-closeCh:
+				require.NoError(t, logsReceiver.Shutdown(context.Background()))
+				return
+			default:
+				err := stanzaReceiver.emitter.Process(context.Background(), entry.New())
+				require.NoError(t, err)
+			}
+			consumedLogCount.Add(1)
+		}
+	}()
+	require.Eventually(t, func() bool {
+		return consumedLogCount.Load() > 100
+	}, 5*time.Second, 5*time.Millisecond)
+
+	close(closeCh)
+
+	// Eventually because of asynchronuous nature of the receiver.
+	require.EventuallyWithT(t,
+		func(t *assert.CollectT) {
+			assert.Equal(t, consumedLogCount.Load(), int32(mockConsumer.LogRecordCount()))
+		},
+		11*time.Second, 5*time.Millisecond,
+	)
 }
 
 func BenchmarkReadLine(b *testing.B) {

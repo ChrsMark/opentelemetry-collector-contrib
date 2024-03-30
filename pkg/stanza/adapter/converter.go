@@ -55,8 +55,11 @@ type Converter struct {
 	// pLogsChan is a channel on which aggregated logs will be sent to.
 	pLogsChan chan plog.Logs
 
-	stopOnce sync.Once
-	stopChan chan struct{}
+	stopOnce             sync.Once
+	stopChan             chan struct{}
+	stopChan2            chan struct{}
+	stopChan3            chan struct{}
+	stopChanConsumerLoop chan struct{}
 
 	// workerChan is an internal communication channel that gets the log
 	// entries from Batch() calls and it receives the data in workerLoop().
@@ -92,12 +95,15 @@ func (o workerCountOption) apply(c *Converter) {
 
 func NewConverter(logger *zap.Logger, opts ...converterOption) *Converter {
 	c := &Converter{
-		workerChan:  make(chan []*entry.Entry),
-		workerCount: int(math.Max(1, float64(runtime.NumCPU()/4))),
-		pLogsChan:   make(chan plog.Logs),
-		stopChan:    make(chan struct{}),
-		flushChan:   make(chan plog.Logs),
-		logger:      logger,
+		workerChan:           make(chan []*entry.Entry),
+		workerCount:          int(math.Max(1, float64(runtime.NumCPU()/4))),
+		pLogsChan:            make(chan plog.Logs),
+		stopChan:             make(chan struct{}),
+		stopChan2:            make(chan struct{}),
+		stopChan3:            make(chan struct{}),
+		stopChanConsumerLoop: make(chan struct{}),
+		flushChan:            make(chan plog.Logs),
+		logger:               logger,
 	}
 	for _, opt := range opts {
 		opt.apply(c)
@@ -113,15 +119,19 @@ func (c *Converter) Start() {
 		go c.workerLoop()
 	}
 
-	c.wg.Add(1)
+	//c.wg.Add(1)
 	go c.flushLoop()
 }
 
 func (c *Converter) Stop() {
 	c.stopOnce.Do(func() {
-		close(c.stopChan)
+		// start final flushing here
+		close(c.workerChan)
+		// wait for the workerloops to complete
 		c.wg.Wait()
-		close(c.pLogsChan)
+		// trigger the flush and the consumerloop to finish
+		close(c.flushChan)
+		//close(c.pLogsChan)
 	})
 }
 
@@ -136,62 +146,41 @@ func (c *Converter) OutChannel() <-chan plog.Logs {
 func (c *Converter) workerLoop() {
 	defer c.wg.Done()
 
-	for {
+	for entries := range c.workerChan {
+		resourceHashToIdx := make(map[uint64]int)
 
-		select {
-		case <-c.stopChan:
-			return
-
-		case entries, ok := <-c.workerChan:
+		pLogs := plog.NewLogs()
+		var sl plog.ScopeLogs
+		for _, e := range entries {
+			resourceID := HashResource(e.Resource)
+			resourceIdx, ok := resourceHashToIdx[resourceID]
 			if !ok {
-				return
+				resourceHashToIdx[resourceID] = pLogs.ResourceLogs().Len()
+				rl := pLogs.ResourceLogs().AppendEmpty()
+				upsertToMap(e.Resource, rl.Resource().Attributes())
+				sl = rl.ScopeLogs().AppendEmpty()
+			} else {
+				sl = pLogs.ResourceLogs().At(resourceIdx).ScopeLogs().At(0)
 			}
-
-			resourceHashToIdx := make(map[uint64]int)
-
-			pLogs := plog.NewLogs()
-			var sl plog.ScopeLogs
-			for _, e := range entries {
-				resourceID := HashResource(e.Resource)
-				resourceIdx, ok := resourceHashToIdx[resourceID]
-				if !ok {
-					resourceHashToIdx[resourceID] = pLogs.ResourceLogs().Len()
-					rl := pLogs.ResourceLogs().AppendEmpty()
-					upsertToMap(e.Resource, rl.Resource().Attributes())
-					sl = rl.ScopeLogs().AppendEmpty()
-				} else {
-					sl = pLogs.ResourceLogs().At(resourceIdx).ScopeLogs().At(0)
-				}
-				convertInto(e, sl.LogRecords().AppendEmpty())
-			}
-
-			// Send plogs directly to flushChan
-			select {
-			case c.flushChan <- pLogs:
-			case <-c.stopChan:
-			}
+			convertInto(e, sl.LogRecords().AppendEmpty())
 		}
+
+		// Send plogs directly to flushChan
+		c.flushChan <- pLogs
 	}
+	//close(c.flushChan)
+	return
 }
 
 func (c *Converter) flushLoop() {
-	defer c.wg.Done()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	//defer c.wg.Done()
 
-	for {
-		select {
-		case <-c.stopChan:
-			return
-
-		case pLogs := <-c.flushChan:
-			if err := c.flush(ctx, pLogs); err != nil {
-				c.logger.Debug("Problem sending log entries",
-					zap.Error(err),
-				)
-			}
-		}
+	for pLogs := range c.flushChan {
+		c.pLogsChan <- pLogs
 	}
+	// trigger the consumerloop to finish
+	close(c.pLogsChan)
+	return
 }
 
 // flush flushes provided plog.Logs entries onto a channel.
@@ -205,7 +194,9 @@ func (c *Converter) flush(ctx context.Context, pLogs plog.Logs) error {
 	case c.pLogsChan <- pLogs:
 
 	// The converter has been stopped so bail the flush.
-	case <-c.stopChan:
+	case <-c.stopChan3:
+		c.pLogsChan <- pLogs
+		// here we need to stop the consumer loop somehow
 		return errors.New("logs converter has been stopped")
 	}
 

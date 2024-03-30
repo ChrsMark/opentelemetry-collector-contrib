@@ -86,6 +86,7 @@ func (m *Manager) Stop() error {
 		m.cancel = nil
 	}
 	m.wg.Wait()
+	// HERE: step2 to close the readers
 	m.closePreviousFiles()
 	if m.persister != nil {
 		checkpoints := make([]*reader.Metadata, 0, m.totalReaders())

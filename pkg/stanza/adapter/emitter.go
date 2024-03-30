@@ -149,6 +149,10 @@ func (e *LogEmitter) flusher(ctx context.Context) {
 				e.flush(ctx, oldBatch)
 			}
 		case <-ctx.Done():
+			// flush on shutdown
+			if oldBatch := e.makeNewBatch(); len(oldBatch) > 0 {
+				e.flush(ctx, oldBatch)
+			}
 			return
 		}
 	}
@@ -156,10 +160,7 @@ func (e *LogEmitter) flusher(ctx context.Context) {
 
 // flush flushes the provided batch to the log channel.
 func (e *LogEmitter) flush(ctx context.Context, batch []*entry.Entry) {
-	select {
-	case e.logChan <- batch:
-	case <-ctx.Done():
-	}
+	e.logChan <- batch
 }
 
 // makeNewBatch replaces the current batch on the log emitter with a new batch, returning the old one

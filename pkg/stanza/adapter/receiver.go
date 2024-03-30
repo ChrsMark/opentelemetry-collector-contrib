@@ -6,8 +6,6 @@ package adapter // import "github.com/open-telemetry/opentelemetry-collector-con
 import (
 	"context"
 	"fmt"
-	"sync"
-
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/extension/experimental/storage"
@@ -15,6 +13,7 @@ import (
 	"go.opentelemetry.io/collector/receiver/receiverhelper"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
+	"sync"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/pipeline"
 )
@@ -59,13 +58,14 @@ func (r *receiver) Start(ctx context.Context, host component.Host) error {
 	//   them to converter
 	// ...
 	r.wg.Add(1)
-	go r.emitterLoop(rctx)
+	rctr, cancel := context.WithCancel(ctx)
+	go r.emitterLoop(rctx, cancel)
 
 	// ...
 	// * second one which reads all the logs produced by the converter
 	//   (aggregated by Resource) and then calls consumer to consumer them.
 	r.wg.Add(1)
-	go r.consumerLoop(rctx)
+	go r.consumerLoop(rctr)
 
 	// Those 2 loops are started in separate goroutines because batching in
 	// the emitter loop can cause a flush, caused by either reaching the max
@@ -79,56 +79,34 @@ func (r *receiver) Start(ctx context.Context, host component.Host) error {
 
 // emitterLoop reads the log entries produced by the emitter and batches them
 // in converter.
-func (r *receiver) emitterLoop(ctx context.Context) {
+func (r *receiver) emitterLoop(ctx context.Context, cancel context.CancelFunc) {
 	defer r.wg.Done()
 
-	// Don't create done channel on every iteration.
-	doneChan := ctx.Done()
-	for {
-		select {
-		case <-doneChan:
-			r.logger.Debug("Receive loop stopped")
-			return
-
-		case e, ok := <-r.emitter.logChan:
-			if !ok {
-				continue
-			}
-
-			if err := r.converter.Batch(e); err != nil {
-				r.logger.Error("Could not add entry to batch", zap.Error(err))
-			}
+	for e := range r.emitter.logChan {
+		if err := r.converter.Batch(e); err != nil {
+			r.logger.Error("Could not add entry to batch", zap.Error(err))
 		}
 	}
+	// signal the Converter to immidiately flush and stop. The Converter will stop the consumerLoop
+	r.converter.Stop()
+	return
 }
 
 // consumerLoop reads converter log entries and calls the consumer to consumer them.
 func (r *receiver) consumerLoop(ctx context.Context) {
 	defer r.wg.Done()
 
-	// Don't create done channel on every iteration.
-	doneChan := ctx.Done()
 	pLogsChan := r.converter.OutChannel()
-	for {
-		select {
-		case <-doneChan:
-			r.logger.Debug("Consumer loop stopped")
-			return
-
-		case pLogs, ok := <-pLogsChan:
-			if !ok {
-				r.logger.Debug("Converter channel got closed")
-				continue
-			}
-			obsrecvCtx := r.obsrecv.StartLogsOp(ctx)
-			logRecordCount := pLogs.LogRecordCount()
-			cErr := r.consumer.ConsumeLogs(ctx, pLogs)
-			if cErr != nil {
-				r.logger.Error("ConsumeLogs() failed", zap.Error(cErr))
-			}
-			r.obsrecv.EndLogsOp(obsrecvCtx, "stanza", logRecordCount, cErr)
+	for pLogs := range pLogsChan {
+		obsrecvCtx := r.obsrecv.StartLogsOp(ctx)
+		logRecordCount := pLogs.LogRecordCount()
+		cErr := r.consumer.ConsumeLogs(ctx, pLogs)
+		if cErr != nil {
+			r.logger.Error("ConsumeLogs() failed", zap.Error(cErr))
 		}
+		r.obsrecv.EndLogsOp(obsrecvCtx, "stanza", logRecordCount, cErr)
 	}
+	return
 }
 
 // Shutdown is invoked during service shutdown
@@ -137,10 +115,13 @@ func (r *receiver) Shutdown(ctx context.Context) error {
 		return nil
 	}
 
-	r.logger.Info("Stopping stanza receiver")
+	r.logger.Warn("Stopping stanza receiver")
+	// HEHE: step1: this will need to first stop all the readers in step2
+	// the readers stop happens syncronously
+	// this will also stop the emmiter and hence the r.emitter.logChan. It can be the first trigger point
 	pipelineErr := r.pipe.Stop()
-	r.converter.Stop()
-	r.cancel()
+	// here the Reader should be stopped
+	// here in order to properly stop the converter
 	r.wg.Wait()
 
 	if r.storageClient != nil {
