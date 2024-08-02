@@ -83,7 +83,47 @@ func (obs *observerHandler) OnAdd(added []observer.Endpoint) {
 			continue
 		}
 
-		obs.params.TelemetrySettings.Logger.Debug("handling added endpoint", zap.Any("env", env))
+		obs.params.TelemetrySettings.Logger.Info("handling added endpoint", zap.Any("env", env))
+
+		ann := env["annotations"]
+		if ann != nil {
+			annotations, ok := ann.(map[string]string)
+			if !ok {
+				// Can't assert, handle error.
+			}
+			if len(annotations) > 0 {
+				// detect if there are hints
+				subreceiverKey := annotations["otel.hints/receiver"]
+				if subreceiverKey == "" {
+					break
+				}
+				obs.params.TelemetrySettings.Logger.Warn("handling added hinted receiver", zap.Any("subreceiverKey", subreceiverKey))
+
+				userConfigMap := userConfigMap{"collection_interval": "10s"}
+				subreceiverEndpoint := annotations["otel.hints/endpoint"]
+				if subreceiverEndpoint == "" {
+					break
+				}
+				userConfigMap["endpoint"] = subreceiverEndpoint
+				subreceiver, err := newReceiverTemplate(subreceiverKey, userConfigMap)
+				if err != nil {
+					// TODO: handle error here
+					obs.params.TelemetrySettings.Logger.Debug("error adding subreceiver1", zap.Any("err", err))
+					break
+				}
+
+				subreceiver.Rule = "type == \"pod\""
+				subreceiver.rule, err = newRule(subreceiver.Rule)
+				if err != nil {
+					// TODO: handle error here
+					obs.params.TelemetrySettings.Logger.Debug("error adding subreceiver rule", zap.Any("err", err))
+					break
+				}
+
+				obs.config.receiverTemplates[subreceiverKey] = subreceiver
+			}
+		}
+		obs.params.TelemetrySettings.Logger.Debug("handling added templates", zap.Any("templates", obs.config.receiverTemplates))
 
 		for _, template := range obs.config.receiverTemplates {
 			if matches, e := template.rule.eval(env); e != nil {
@@ -96,7 +136,8 @@ func (obs *observerHandler) OnAdd(added []observer.Endpoint) {
 			obs.params.TelemetrySettings.Logger.Info("starting receiver",
 				zap.String("name", template.id.String()),
 				zap.String("endpoint", e.Target),
-				zap.String("endpoint_id", string(e.ID)))
+				zap.String("endpoint_id", string(e.ID)),
+				zap.Any("config", template.config))
 
 			resolvedConfig, err := expandConfig(template.config, env)
 			if err != nil {
