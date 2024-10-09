@@ -83,7 +83,7 @@ func (obs *observerHandler) OnAdd(added []observer.Endpoint) {
 			continue
 		}
 
-		if obs.config.Hints.K8s.Metrics.Enabled {
+		if obs.config.Hints.K8s.Metrics.Enabled || obs.config.Hints.K8s.Logs.Enabled {
 			k8sHintsBuilder := K8sHintsBuilder{obs.params.TelemetrySettings.Logger, obs.config.Hints.K8s}
 			subreceiverTemplate, err := k8sHintsBuilder.createReceiverTemplateFromHints(env)
 			if err != nil {

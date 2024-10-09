@@ -87,9 +87,14 @@ type HintsConfig struct {
 
 type K8sHintsConfig struct {
 	Metrics MetricsHints `mapstructure:"metrics"`
+	Logs    MetricsHints `mapstructure:"logs"`
 }
 
 type MetricsHints struct {
+	Enabled bool `mapstructure:"enabled"`
+}
+
+type LogsHints struct {
 	Enabled bool `mapstructure:"enabled"`
 }
 

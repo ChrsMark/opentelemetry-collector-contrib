@@ -14,12 +14,14 @@ import (
 const (
 	otelHints                      = "io.opentelemetry.collector.receiver-creator"
 	metricsHint                    = "metrics"
+	logsHint                       = "logs"
 	hintsMetricsReceiver           = "receiver"
 	hintsMetricsEndpoint           = "endpoint"
 	hintsMetricsCollectionInterval = "collection_interval"
 	hintsMetricsTimeout            = "timeout"
 	hintsMetricsUsername           = "username"
 	hintsMetricsPassword           = "password"
+	hintsLogsEnableCollection      = "enabled"
 )
 
 // HintsTemplatesBuilder creates configuration templates from provided hints.
@@ -39,7 +41,7 @@ type K8sHintsBuilder struct {
 // TODO: Logs configurations are only created for Pod Container Endpoints.
 func (builder *K8sHintsBuilder) createReceiverTemplateFromHints(env observer.EndpointEnv) (*receiverTemplate, error) {
 	var endpointType string
-	var podUID string
+	var podUID, namespace, podName string
 	var annotations map[string]string
 
 	builder.logger.Debug("handling hints for added endpoint", zap.Any("env", env))
@@ -57,6 +59,8 @@ func (builder *K8sHintsBuilder) createReceiverTemplateFromHints(env observer.End
 			}
 		}
 		podUID = endpointPod["uid"].(string)
+		podName = endpointPod["name"].(string)
+		namespace = endpointPod["namespace"].(string)
 	} else {
 		return nil, nil
 	}
@@ -74,6 +78,11 @@ func (builder *K8sHintsBuilder) createReceiverTemplateFromHints(env observer.End
 		if endpointType == string(observer.PortType) && builder.config.Metrics.Enabled {
 			// Only handle Endpoints of type port for metrics
 			return builder.createMetricsReceiver(annotations, env, podUID)
+		}
+
+		if endpointType == string(observer.PodContainerType) && builder.config.Logs.Enabled {
+			// Only handle Endpoints of type pod.container for logs
+			return builder.createLogsReceiver(annotations, env, podUID, podName, namespace)
 		}
 	}
 	return nil, nil
@@ -116,6 +125,34 @@ func (builder *K8sHintsBuilder) createMetricsReceiver(
 
 }
 
+func (builder *K8sHintsBuilder) createLogsReceiver(
+	annotations map[string]string,
+	env observer.EndpointEnv,
+	podUID, podName, namespace string) (*receiverTemplate, error) {
+
+	containerName := env["container_name"].(string)
+	logsHintEnabled := getHintAnnotation(annotations, logsHint, hintsLogsEnableCollection, containerName)
+
+	if logsHintEnabled != "true" {
+		// no logs hints detected
+		return nil, nil
+	}
+	subreceiverKey := "filelog"
+	builder.logger.Debug("handling added hinted receiver", zap.Any("subreceiverKey", subreceiverKey))
+
+	userConfMap := createLogsConfig(annotations, env, containerName, podUID, podName, namespace)
+
+	subreceiver, err := newReceiverTemplate(fmt.Sprintf("%v/%v_%v", subreceiverKey, podUID, containerName), userConfMap)
+	if err != nil {
+		builder.logger.Error("error adding subreceiver", zap.Any("err", err))
+		return nil, err
+	}
+
+	builder.logger.Debug("adding hinted receiver", zap.Any("subreceiver", subreceiver))
+	return &subreceiver, nil
+
+}
+
 func createMetricsConfig(annotations map[string]string, env observer.EndpointEnv, portName string) userConfigMap {
 	confMap := map[string]any{}
 
@@ -146,6 +183,21 @@ func createMetricsConfig(annotations map[string]string, env observer.EndpointEnv
 		confMap["password"] = subreceiverPassword
 	}
 	return confMap
+}
+
+func createLogsConfig(
+	_ map[string]string,
+	_ observer.EndpointEnv,
+	containerName, podUID, podName, namespace string) userConfigMap {
+
+	logPath := fmt.Sprintf("/var/log/pods/%s_%s_%s/%s/*.log", namespace, podName, podUID, containerName)
+	userConfigMap := userConfigMap{
+		"include":           []string{logPath},
+		"include_file_path": true,
+		"operators":         []map[string]any{{"id": "container-parser", "type": "container"}},
+	}
+	// TODO: expose more settings as hints
+	return userConfigMap
 }
 
 func getHintAnnotation(annotations map[string]string, hintType string, hintKey string, suffix string) string {
