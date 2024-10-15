@@ -5,14 +5,14 @@ package receivercreator // import "github.com/open-telemetry/opentelemetry-colle
 
 import (
 	"fmt"
-
-	"go.uber.org/zap"
+	"gopkg.in/yaml.v3"
+	"strings"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/observer"
+	"go.uber.org/zap"
 )
 
 const (
-	otelHints                      = "io.opentelemetry.collector.receiver-creator"
 	metricsHint                    = "metrics"
 	hintsMetricsReceiver           = "receiver"
 	hintsMetricsEndpoint           = "endpoint"
@@ -20,6 +20,11 @@ const (
 	hintsMetricsTimeout            = "timeout"
 	hintsMetricsUsername           = "username"
 	hintsMetricsPassword           = "password"
+
+	otelHints            = "opentelemetry.io/discovery"
+	discoveryEnabledHint = "enabled"
+	scraperHint          = "scraper"
+	configHint           = "config/"
 )
 
 // HintsTemplatesBuilder creates configuration templates from provided hints.
@@ -87,7 +92,7 @@ func (builder *K8sHintsBuilder) createMetricsReceiver(
 	var port uint16
 
 	portName := env["name"].(string)
-	subreceiverKey := getHintAnnotation(annotations, metricsHint, hintsMetricsReceiver, portName)
+	subreceiverKey := getHintAnnotation(annotations, hintsMetricsReceiver, portName)
 
 	if subreceiverKey == "" {
 		// no metrics hints detected
@@ -125,41 +130,85 @@ func createMetricsConfig(annotations map[string]string, env observer.EndpointEnv
 		confMap["endpoint"] = defaultEndpoint
 	}
 
-	subreceiverEndpoint := getHintAnnotation(annotations, metricsHint, hintsMetricsEndpoint, portName)
-	if subreceiverEndpoint != "" {
-		confMap["endpoint"] = subreceiverEndpoint
-	}
-	subreceiverColInterval := getHintAnnotation(annotations, metricsHint, hintsMetricsCollectionInterval, portName)
-	if subreceiverColInterval != "" {
-		confMap["collection_interval"] = subreceiverColInterval
-	}
-	subreceiverTimeout := getHintAnnotation(annotations, metricsHint, hintsMetricsTimeout, portName)
-	if subreceiverTimeout != "" {
-		confMap["timeout"] = subreceiverTimeout
-	}
-	subreceiverUsername := getHintAnnotation(annotations, metricsHint, hintsMetricsUsername, portName)
-	if subreceiverUsername != "" {
-		confMap["username"] = subreceiverUsername
-	}
-	subreceiverPassword := getHintAnnotation(annotations, metricsHint, hintsMetricsPassword, portName)
-	if subreceiverPassword != "" {
-		confMap["password"] = subreceiverPassword
-	}
+	//subreceiverEndpoint := getHintAnnotation(annotations, metricsHint, hintsMetricsEndpoint, portName)
+	//if subreceiverEndpoint != "" {
+	//	confMap["endpoint"] = subreceiverEndpoint
+	//}
+	//subreceiverColInterval := getHintAnnotation(annotations, metricsHint, hintsMetricsCollectionInterval, portName)
+	//if subreceiverColInterval != "" {
+	//	confMap["collection_interval"] = subreceiverColInterval
+	//}
+	//subreceiverTimeout := getHintAnnotation(annotations, metricsHint, hintsMetricsTimeout, portName)
+	//if subreceiverTimeout != "" {
+	//	confMap["timeout"] = subreceiverTimeout
+	//}
+	//subreceiverUsername := getHintAnnotation(annotations, metricsHint, hintsMetricsUsername, portName)
+	//if subreceiverUsername != "" {
+	//	confMap["username"] = subreceiverUsername
+	//}
+	//subreceiverPassword := getHintAnnotation(annotations, metricsHint, hintsMetricsPassword, portName)
+	//if subreceiverPassword != "" {
+	//	confMap["password"] = subreceiverPassword
+	//}
 	return confMap
 }
 
-func getHintAnnotation(annotations map[string]string, hintType string, hintKey string, suffix string) string {
+func getHintAnnotation(annotations map[string]string, hintKey string, suffix string) string {
 	// try to scope the hint more on container level by suffixing with .<port_name>
-	containerLevelHint := annotations[fmt.Sprintf("%s.%s.%s/%s", otelHints, hintType, suffix, hintKey)]
+	containerLevelHint := annotations[fmt.Sprintf("%s.%s/%s", otelHints, suffix, hintKey)]
 	if containerLevelHint != "" {
 		return containerLevelHint
 	}
 
 	// if there is no container level hint defined try to use the Pod level hint
-	podHintKey := fmt.Sprintf("%s.%s/%s", otelHints, hintType, hintKey)
+	podHintKey := fmt.Sprintf("%s/%s", otelHints, hintKey)
 	podLevelHint := annotations[podHintKey]
 	if podLevelHint != "" {
 		return podLevelHint
 	}
 	return ""
+}
+
+func getConfFromAnnotations(annotations map[string]string, scopeSuffix string) userConfigMap {
+	var annotationPrefixScoped string
+	annotationPrefix := fmt.Sprintf("%s/%s", otelHints, configHint)
+
+	if scopeSuffix != "" {
+		annotationPrefixScoped = fmt.Sprintf("%s.%s/%s", otelHints, scopeSuffix, configHint)
+	}
+	conf := userConfigMap{}
+	for key, val := range annotations {
+		if strings.HasPrefix(key, annotationPrefixScoped) && annotationPrefixScoped != "" {
+			res, _ := strings.CutPrefix(key, annotationPrefixScoped)
+
+			var dst map[string]any
+			if err := yaml.Unmarshal([]byte(val), &dst); err == nil {
+				conf[res] = dst
+			} else {
+				conf[res] = val
+			}
+		} else if strings.HasPrefix(key, annotationPrefix) {
+			res, _ := strings.CutPrefix(key, annotationPrefix)
+
+			if _, ok := conf[res]; !ok {
+				// only use top level annotation in case there is no scope level annotation already set
+				var dst map[string]any
+				if err := yaml.Unmarshal([]byte(val), &dst); err == nil {
+					conf[res] = dst
+				} else {
+					conf[res] = val
+				}
+			}
+		}
+	}
+	return conf
+}
+
+func discoveryEnabled(annotations map[string]string, scopeSuffix string) bool {
+	hintVal := getHintAnnotation(annotations, discoveryEnabledHint, scopeSuffix)
+	if hintVal == "true" {
+		return true
+	} else {
+		return false
+	}
 }

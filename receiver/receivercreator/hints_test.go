@@ -148,21 +148,143 @@ func TestK8sHintsBuilderMetrics(t *testing.T) {
 	}
 }
 
-func TestGetHintAnnotation(t *testing.T) {
-	metricsHintsAnn := map[string]string{
-		"io.opentelemetry.collector.receiver-creator.metrics/receiver": "redis",
+//func TestGetHintAnnotation(t *testing.T) {
+//	metricsHintsAnn := map[string]string{
+//		"io.opentelemetry.collector.receiver-creator.metrics/receiver": "redis",
+//	}
+//	assert.Equal(
+//		t,
+//		"redis",
+//		getHintAnnotation(metricsHintsAnn, metricsHint, hintsMetricsReceiver, "webport"),
+//	)
+//	logsHintsAnn := map[string]string{
+//		"io.opentelemetry.collector.receiver-creator.logs/receiver": "redis",
+//	}
+//	assert.Equal(
+//		t,
+//		"redis",
+//		getHintAnnotation(logsHintsAnn, "logs", "receiver", "webport"),
+//	)
+//}
+
+func TestGetConfFromAnnotations(t *testing.T) {
+	hintsAnn := map[string]string{
+		"opentelemetry.io/discovery/config/endpoint":            "0.0.0.0:8080",
+		"opentelemetry.io/discovery/config/collection_interval": "20s",
+		"opentelemetry.io/discovery/config/initial_delay":       "20s",
+		"opentelemetry.io/discovery/config/read_buffer_size":    "10",
+	}
+	expectedConf := userConfigMap{
+		"collection_interval": "20s",
+		"endpoint":            "0.0.0.0:8080",
+		"initial_delay":       "20s",
+		"read_buffer_size":    "10",
 	}
 	assert.Equal(
 		t,
-		"redis",
-		getHintAnnotation(metricsHintsAnn, metricsHint, hintsMetricsReceiver, "webport"),
+		expectedConf,
+		getConfFromAnnotations(hintsAnn, ""),
 	)
-	logsHintsAnn := map[string]string{
-		"io.opentelemetry.collector.receiver-creator.logs/receiver": "redis",
+
+	var dat string = `
+entries: 
+  - keya1: val1
+    keya2: val2
+foo: bar`
+	hintsAnn2 := map[string]string{
+		"opentelemetry.io/discovery/config/read_buffer_size":        "10",
+		"opentelemetry.io/discovery/config/read_buffer_size_nested": dat,
+	}
+	expectedConf2 := userConfigMap{
+		"read_buffer_size": "10",
+		"read_buffer_size_nested": map[string]any{
+			"foo": "bar",
+			"entries": []any{map[string]any{
+				"keya1": "val1",
+				"keya2": "val2"}},
+		},
 	}
 	assert.Equal(
 		t,
-		"redis",
-		getHintAnnotation(logsHintsAnn, "logs", "receiver", "webport"),
+		expectedConf2,
+		getConfFromAnnotations(hintsAnn2, ""),
+	)
+
+	hintsAnn3 := map[string]string{
+		"opentelemetry.io/discovery.webport/config/read_buffer_size": "10",
+		"opentelemetry.io/discovery/config/read_buffer_size":         "20",
+		"opentelemetry.io/discovery/config/read_buffer_size_nested":  dat,
+	}
+	expectedConf3 := userConfigMap{
+		"read_buffer_size": "10",
+		"read_buffer_size_nested": map[string]any{
+			"foo": "bar",
+			"entries": []any{map[string]any{
+				"keya1": "val1",
+				"keya2": "val2"}},
+		},
+	}
+	assert.Equal(
+		t,
+		expectedConf3,
+		getConfFromAnnotations(hintsAnn3, "webport"),
+	)
+}
+
+func TestDiscoveryEnabled(t *testing.T) {
+	hintsAnn := map[string]string{
+		"opentelemetry.io/discovery/config/endpoint":            "0.0.0.0:8080",
+		"opentelemetry.io/discovery/config/collection_interval": "20s",
+		"opentelemetry.io/discovery/config/initial_delay":       "20s",
+		"opentelemetry.io/discovery/config/read_buffer_size":    "10",
+		"opentelemetry.io/discovery/enabled":                    "true",
+	}
+	expected := true
+	assert.Equal(
+		t,
+		expected,
+		discoveryEnabled(hintsAnn, ""),
+	)
+
+	hintsAnn = map[string]string{
+		"opentelemetry.io/discovery/config/endpoint":            "0.0.0.0:8080",
+		"opentelemetry.io/discovery/config/collection_interval": "20s",
+		"opentelemetry.io/discovery/config/initial_delay":       "20s",
+		"opentelemetry.io/discovery/config/read_buffer_size":    "10",
+		"opentelemetry.io/discovery/enabled":                    "false",
+	}
+	expected = false
+	assert.Equal(
+		t,
+		expected,
+		discoveryEnabled(hintsAnn, ""),
+	)
+
+	hintsAnn = map[string]string{
+		"opentelemetry.io/discovery/config/endpoint":            "0.0.0.0:8080",
+		"opentelemetry.io/discovery/config/collection_interval": "20s",
+		"opentelemetry.io/discovery/config/initial_delay":       "20s",
+		"opentelemetry.io/discovery/config/read_buffer_size":    "10",
+		"opentelemetry.io/discovery.some/enabled":               "true",
+	}
+	expected = true
+	assert.Equal(
+		t,
+		expected,
+		discoveryEnabled(hintsAnn, "some"),
+	)
+
+	hintsAnn = map[string]string{
+		"opentelemetry.io/discovery/config/endpoint":            "0.0.0.0:8080",
+		"opentelemetry.io/discovery/config/collection_interval": "20s",
+		"opentelemetry.io/discovery/config/initial_delay":       "20s",
+		"opentelemetry.io/discovery/config/read_buffer_size":    "10",
+		"opentelemetry.io/discovery.some/enabled":               "false",
+	}
+	expected = false
+	assert.Equal(
+		t,
+		expected,
+		discoveryEnabled(hintsAnn, ""),
 	)
 }
