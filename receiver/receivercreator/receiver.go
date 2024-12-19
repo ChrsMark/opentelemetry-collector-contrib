@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go.opentelemetry.io/collector/pipeline"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
@@ -39,6 +40,8 @@ func newReceiverCreator(params receiver.Settings, cfg *Config) receiver.Metrics 
 type host interface {
 	component.Host
 	GetFactory(component.Kind, component.Type) component.Factory
+	AddComponent(pipelineID pipeline.ID, kind component.Kind, compID component.ID, conf component.Config) error
+	RemoveComponent(kind component.Kind, compID component.ID) error
 }
 
 // Start receiver_creator.

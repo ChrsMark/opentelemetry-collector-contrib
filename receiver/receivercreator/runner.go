@@ -5,7 +5,6 @@ package receivercreator // import "github.com/open-telemetry/opentelemetry-colle
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 
@@ -22,9 +21,9 @@ import (
 // runner starts and stops receiver instances.
 type runner interface {
 	// start a metrics receiver instance from its static config and discovered config.
-	start(receiver receiverConfig, discoveredConfig userConfigMap, consumer *enhancingConsumer) (component.Component, error)
+	start(receiver receiverConfig, discoveredConfig userConfigMap) (*component.ID, error)
 	// shutdown a receiver.
-	shutdown(rcvr component.Component) error
+	shutdown(rcvrID component.ID) error
 }
 
 // receiverRunner handles starting/stopping of a concrete subreceiver instance.
@@ -53,8 +52,7 @@ var _ runner = (*receiverRunner)(nil)
 func (run *receiverRunner) start(
 	receiver receiverConfig,
 	discoveredConfig userConfigMap,
-	consumer *enhancingConsumer,
-) (component.Component, error) {
+) (*component.ID, error) {
 	factory := run.host.GetFactory(component.KindReceiver, receiver.id.Type())
 
 	if factory == nil {
@@ -69,55 +67,20 @@ func (run *receiverRunner) start(
 	}
 
 	// Sets dynamically created receiver to something like receiver_creator/1/redis{endpoint="localhost:6380"}/<EndpointID>.
-	id := component.NewIDWithName(factory.Type(), fmt.Sprintf("%s/%s{endpoint=%q}/%s", receiver.id.Name(), run.idNamespace, targetEndpoint, receiver.endpointID))
+	componentID := component.NewIDWithName(factory.Type(), fmt.Sprintf("%s/%s{endpoint=%q}/%s", receiver.id.Name(), run.idNamespace, targetEndpoint, receiver.endpointID))
 
-	wr := &wrappedReceiver{}
-	var createError error
-	if consumer.logs != nil {
-		if wr.logs, err = run.createLogsRuntimeReceiver(receiverFactory, id, cfg, consumer); err != nil {
-			if errors.Is(err, pipeline.ErrSignalNotSupported) {
-				run.logger.Info("instantiated receiver doesn't support logs", zap.String("receiver", receiver.id.String()), zap.Error(err))
-				wr.logs = nil
-			} else {
-				createError = multierr.Combine(createError, err)
-			}
-		}
-	}
-	if consumer.metrics != nil {
-		if wr.metrics, err = run.createMetricsRuntimeReceiver(receiverFactory, id, cfg, consumer); err != nil {
-			if errors.Is(err, pipeline.ErrSignalNotSupported) {
-				run.logger.Info("instantiated receiver doesn't support metrics", zap.String("receiver", receiver.id.String()), zap.Error(err))
-				wr.metrics = nil
-			} else {
-				createError = multierr.Combine(createError, err)
-			}
-		}
-	}
-	if consumer.traces != nil {
-		if wr.traces, err = run.createTracesRuntimeReceiver(receiverFactory, id, cfg, consumer); err != nil {
-			if errors.Is(err, pipeline.ErrSignalNotSupported) {
-				run.logger.Info("instantiated receiver doesn't support traces", zap.String("receiver", receiver.id.String()), zap.Error(err))
-				wr.traces = nil
-			} else {
-				createError = multierr.Combine(createError, err)
-			}
-		}
+	err = run.host.AddComponent(pipeline.NewID(pipeline.SignalMetrics), component.KindReceiver, componentID, cfg)
+	if err != nil {
+		run.logger.Error(fmt.Sprintf("Xcreator error on adding receiver: %s", err.Error()))
+		return nil, fmt.Errorf(fmt.Sprintf("Xcreator error on adding receiver: %s", err.Error()))
 	}
 
-	if createError != nil {
-		return nil, fmt.Errorf("failed creating endpoint-derived receiver: %w", createError)
-	}
-
-	if err = wr.Start(context.Background(), run.host); err != nil {
-		return nil, fmt.Errorf("failed starting endpoint-derived receiver: %w", err)
-	}
-
-	return wr, nil
+	return &componentID, nil
 }
 
 // shutdown the given receiver.
-func (run *receiverRunner) shutdown(rcvr component.Component) error {
-	return rcvr.Shutdown(context.Background())
+func (run *receiverRunner) shutdown(rcvrID component.ID) error {
+	return run.host.RemoveComponent(component.KindReceiver, rcvrID)
 }
 
 // loadRuntimeReceiverConfig loads the given receiverTemplate merged with config values

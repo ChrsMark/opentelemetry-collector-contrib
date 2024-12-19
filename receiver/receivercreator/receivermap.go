@@ -11,15 +11,15 @@ import (
 
 // receiverMap is a multimap for mapping one id to many receivers. It does
 // not deduplicate the same value being associated with the same key.
-type receiverMap map[observer.EndpointID][]component.Component
+type receiverMap map[observer.EndpointID][]component.ID
 
 // Put rcvr into key id. If rcvr is a duplicate it will still be added.
-func (rm receiverMap) Put(id observer.EndpointID, rcvr component.Component) {
-	rm[id] = append(rm[id], rcvr)
+func (rm receiverMap) Put(id observer.EndpointID, rcvrID component.ID) {
+	rm[id] = append(rm[id], rcvrID)
 }
 
 // Get receivers by id.
-func (rm receiverMap) Get(id observer.EndpointID) []component.Component {
+func (rm receiverMap) Get(id observer.EndpointID) []component.ID {
 	return rm[id]
 }
 
@@ -29,7 +29,7 @@ func (rm receiverMap) RemoveAll(id observer.EndpointID) {
 }
 
 // Get all receivers in the map.
-func (rm receiverMap) Values() (out []component.Component) {
+func (rm receiverMap) Values() (out []component.ID) {
 	for _, m := range rm {
 		out = append(out, m...)
 	}

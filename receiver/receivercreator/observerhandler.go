@@ -123,13 +123,14 @@ func (obs *observerHandler) OnRemove(removed []observer.Endpoint) {
 			ce.Write(fields...)
 		}
 
-		for _, rcvr := range obs.receiversByEndpointID.Get(e.ID) {
-			obs.params.TelemetrySettings.Logger.Info("stopping receiver", zap.Reflect("receiver", rcvr), zap.String("endpoint_id", string(e.ID)))
+		for _, rcvrID := range obs.receiversByEndpointID.Get(e.ID) {
+			obs.params.TelemetrySettings.Logger.Info("stopping receiver", zap.Reflect("receiver", rcvrID), zap.String("endpoint_id", string(e.ID)))
 
-			if err := obs.runner.shutdown(rcvr); err != nil {
-				obs.params.TelemetrySettings.Logger.Error("failed to stop receiver", zap.Reflect("receiver", rcvr), zap.Error(err))
+			if err := obs.runner.shutdown(rcvrID); err != nil {
+				obs.params.TelemetrySettings.Logger.Error("failed to stop receiver", zap.Reflect("receiver", rcvrID), zap.Error(err))
 				continue
 			}
+			obs.params.TelemetrySettings.Logger.Info("receiver stopped", zap.Reflect("receiver", rcvrID), zap.String("endpoint_id", string(e.ID)))
 		}
 		obs.receiversByEndpointID.RemoveAll(e.ID)
 	}
@@ -199,7 +200,7 @@ func (obs *observerHandler) startReceiver(template receiverTemplate, env observe
 
 	filterConsumerSignals(consumer, template.signals)
 
-	var receiver component.Component
+	var receiver *component.ID
 	if receiver, err = obs.runner.start(
 		receiverConfig{
 			id:         template.id,
@@ -207,12 +208,11 @@ func (obs *observerHandler) startReceiver(template receiverTemplate, env observe
 			endpointID: e.ID,
 		},
 		discoveredConfig,
-		consumer,
 	); err != nil {
 		obs.params.TelemetrySettings.Logger.Error("failed to start receiver", zap.String("receiver", template.id.String()), zap.Error(err))
 		return
 	}
-	obs.receiversByEndpointID.Put(e.ID, receiver)
+	obs.receiversByEndpointID.Put(e.ID, *receiver)
 }
 
 func filterConsumerSignals(consumer *enhancingConsumer, signals receiverSignals) {
