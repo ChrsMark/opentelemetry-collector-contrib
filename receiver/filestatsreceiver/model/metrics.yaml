@@ -2,7 +2,7 @@ groups:
   - id: file.mtime
     type: metric
     metric_name: file.mtime
-    stability: beta
+    stability: stable
     brief: "Elapsed time since the last modification of the file or folder, in seconds since Epoch."
     instrument: updowncounter
     unit: "s"
@@ -57,3 +57,19 @@ groups:
       scraper:
         enabled: false
         value_type: int
+  - id: process.cpu.time
+    type: metric
+    brief: Local brief of process cpu time
+    metric_name: process.cpu.time
+    extends: metric.process.cpu.time
+    stability: beta
+    unit: "s"
+    instrument: counter
+    annotations:
+      scraper:
+        enabled: true
+        value_type: int
+
+imports:
+  metrics:
+    - process.cpu.time

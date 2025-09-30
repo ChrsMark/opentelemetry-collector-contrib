@@ -3,15 +3,11 @@ groups:
     type: attribute_group
     brief: Resource attributes
     attributes:
-      - id: file.name
+      - ref: file.name
         brief: The name of the file
-        type: string
-        stability: beta
         examples: [ "myapp.log", "passwords.txt", "server.jar" ]
-      - id: file.path
+      - ref: file.path
         brief: The absolute path of the file
-        type: string
-        stability: beta
         examples:
           - /var/log/app.log
           - /etc/passwd
