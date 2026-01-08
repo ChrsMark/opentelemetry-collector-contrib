@@ -31,6 +31,10 @@ func createDefaultConfig() component.Config {
 	return &Config{
 		Distribution:               defaultDistribution,
 		CollectionInterval:         defaultCollectionInterval,
+		Sharding: ShardingConfig{
+			ShardInstanceID: 0,
+			TotalShards:     1,
+		},
 		NodeConditionTypesToReport: defaultNodeConditionsToReport,
 		APIConfig: k8sconfig.APIConfig{
 			AuthType: k8sconfig.AuthTypeServiceAccount,

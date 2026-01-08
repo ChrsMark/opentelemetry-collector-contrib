@@ -6,6 +6,11 @@ package k8sclusterreceiver // import "github.com/open-telemetry/opentelemetry-co
 import (
 	"context"
 	"fmt"
+	"github.com/cespare/xxhash/v2"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -24,7 +29,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
@@ -48,6 +52,27 @@ import (
 type sharedInformer interface {
 	Start(<-chan struct{})
 	WaitForCacheSync(<-chan struct{}) map[reflect.Type]bool
+}
+
+// informerGroup aggregates multiple informers and exposes a factory-like interface used by this receiver.
+type informerGroup struct {
+	informers []cache.SharedIndexInformer
+}
+
+func (g *informerGroup) Start(stop <-chan struct{}) {
+	for _, inf := range g.informers {
+		go inf.Run(stop)
+	}
+}
+
+func (g *informerGroup) WaitForCacheSync(stop <-chan struct{}) map[reflect.Type]bool {
+	syncFns := make([]cache.InformerSynced, 0, len(g.informers))
+	for _, inf := range g.informers {
+		syncFns = append(syncFns, inf.HasSynced)
+	}
+	_ = cache.WaitForCacheSync(stop, syncFns...)
+	// We do not rely on the returned map anywhere; provide an empty one.
+	return map[reflect.Type]bool{}
 }
 
 type resourceWatcher struct {
@@ -107,7 +132,8 @@ func (rw *resourceWatcher) initialize() error {
 }
 
 func (rw *resourceWatcher) prepareSharedInformerFactory() error {
-	factories := rw.getInformerFactories()
+	namespaces := rw.getInformerNamespaces()
+	group := &informerGroup{}
 
 	// Map of supported group version kinds by name of a kind.
 	// If none of the group versions are supported by k8s server for a specific kind,
@@ -138,7 +164,7 @@ func (rw *resourceWatcher) prepareSharedInformerFactory() error {
 			}
 			if supported {
 				anySupported = true
-				rw.setupInformerForKind(gvk, factories)
+				rw.setupInformerForKind(gvk, namespaces, group)
 			}
 		}
 		if !anySupported {
@@ -152,47 +178,26 @@ func (rw *resourceWatcher) prepareSharedInformerFactory() error {
 		rw.setupInformer(gvk.ClusterResourceQuota, metadata.ClusterWideInformerKey, quotaFactory.Quota().V1().ClusterResourceQuotas().Informer())
 		rw.informerFactories = append(rw.informerFactories, quotaFactory)
 	}
-	for _, factory := range factories {
-		rw.informerFactories = append(rw.informerFactories, factory)
-	}
+	// Register the constructed group of informers.
+	rw.informerFactories = append(rw.informerFactories, group)
 
 	return nil
 }
 
-// getInformerFactories creates the informer factories which are used to set up the informers for the
-// resources that should be observed. The informer factories are returned as a map[string]informer.SharedInformerFactory,
-// where the map keys represent the namespace that should be observed. If the factory is created for the whole cluster,
-// the factory is stored under an empty string
-func (rw *resourceWatcher) getInformerFactories() map[string]informers.SharedInformerFactory {
-	factories := map[string]informers.SharedInformerFactory{}
-
+// getInformerNamespaces determines which namespaces should be observed.
+// It returns a slice of namespaces; an empty string represents cluster-wide.
+func (rw *resourceWatcher) getInformerNamespaces() []string {
 	switch {
 	case len(rw.config.Namespaces) > 0:
 		rw.logger.Info("Namespaces filter has been enabled. Nodes and namespaces will not be observed.", zap.String("namespaces", strings.Join(rw.config.Namespaces, ",")))
-		for _, ns := range rw.config.Namespaces {
-			factories[ns] = informers.NewSharedInformerFactoryWithOptions(
-				rw.client,
-				rw.config.MetadataCollectionInterval,
-				informers.WithNamespace(ns),
-			)
-		}
+		return append([]string(nil), rw.config.Namespaces...)
 	case rw.config.Namespace != "":
 		rw.logger.Info("Namespace filter has been enabled. Nodes and namespaces will not be observed.", zap.String("namespace", rw.config.Namespace))
-		factories[rw.config.Namespace] = informers.NewSharedInformerFactoryWithOptions(
-			rw.client,
-			rw.config.MetadataCollectionInterval,
-			informers.WithNamespace(rw.config.Namespace),
-		)
+		return []string{rw.config.Namespace}
 	default:
-		// if no namespace is provided, the informer observes the whole cluster, and is stored under
-		// the key "<cluster-wide-informer-key>"
-		factories[metadata.ClusterWideInformerKey] = informers.NewSharedInformerFactoryWithOptions(
-			rw.client,
-			rw.config.MetadataCollectionInterval,
-		)
+		// if no namespace is provided, observe the whole cluster
+		return []string{metadata.ClusterWideInformerKey}
 	}
-
-	return factories
 }
 
 func (rw *resourceWatcher) isKindSupported(gvk schema.GroupVersionKind) (bool, error) {
@@ -214,68 +219,364 @@ func (rw *resourceWatcher) isKindSupported(gvk schema.GroupVersionKind) (bool, e
 	return false, nil
 }
 
+type sharding struct {
+	shard       uint64
+	totalShards uint64
+}
+
+func (s *sharding) keep(o metav1.Object) bool {
+	h := xxhash.New()
+	h.Write([]byte(o.GetUID()))
+	ret := (h.Sum64() % s.totalShards) == s.shard
+	if ret {
+		fmt.Println("The result of FILTER is KEEP for object with UID ", o.GetUID())
+	} else {
+		fmt.Println("The result of FILTER is SKIP for obejct with UID ", o.GetUID())
+	}
+	return ret
+}
+
+// newShardedInformer builds a SharedIndexInformer with a ListWatch that filters objects by the sharding rule.
+func newShardedInformer(
+	s sharding,
+	objType runtime.Object,
+	listWithCtx func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error),
+	watchWithCtx func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error),
+	resyncPeriod time.Duration,
+	indexers cache.Indexers,
+) cache.SharedIndexInformer {
+	lw := &cache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return listWithCtx(context.Background(), options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			w, err := watchWithCtx(context.Background(), options)
+			if err != nil {
+				return nil, err
+			}
+			return watch.Filter(w, func(in watch.Event) (out watch.Event, keep bool) {
+				a, err := meta.Accessor(in.Object)
+				if err != nil {
+					return in, true
+				}
+				return in, s.keep(a)
+			}), nil
+		},
+		ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+			obj, err := listWithCtx(ctx, options)
+			if err != nil {
+				return nil, err
+			}
+			items, err := meta.ExtractList(obj)
+			if err != nil {
+				// If extraction fails, do not drop the list.
+				return obj, nil
+			}
+			kept := make([]runtime.Object, 0, len(items))
+			for _, it := range items {
+				a, err := meta.Accessor(it)
+				if err != nil {
+					kept = append(kept, it)
+					continue
+				}
+				if s.keep(a) {
+					kept = append(kept, it)
+				}
+			}
+			_ = meta.SetList(obj, kept)
+			return obj, nil
+		},
+		WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+			w, err := watchWithCtx(ctx, options)
+			if err != nil {
+				return nil, err
+			}
+			return watch.Filter(w, func(in watch.Event) (out watch.Event, keep bool) {
+				a, err := meta.Accessor(in.Object)
+				if err != nil {
+					return in, true
+				}
+				return in, s.keep(a)
+			}), nil
+		},
+	}
+	return cache.NewSharedIndexInformer(
+		lw,
+		objType,
+		resyncPeriod,
+		indexers,
+	)
+}
+
 // setupInformerForKind creates the informers for the given GVKs, based on the provided informer factories.
-// The factories are provided as a map[string]informers.SharedInformerFactory where the map keys represent the namespace
-// of the informer factory. For cluster wide informers, an empty string is used as a key
-func (rw *resourceWatcher) setupInformerForKind(kind schema.GroupVersionKind, factories map[string]informers.SharedInformerFactory) {
+// Namespaces represents the namespaces to observe; for cluster-wide, metadata.ClusterWideInformerKey is used.
+func (rw *resourceWatcher) setupInformerForKind(kind schema.GroupVersionKind, namespaces []string, group *informerGroup) {
 	switch kind {
 	case gvk.Pod:
-		for ns, factory := range factories {
-			rw.setupInformer(kind, ns, factory.Core().V1().Pods().Informer())
+		for _, ns := range namespaces {
+			namespace := ns
+			if namespace == metadata.ClusterWideInformerKey {
+				namespace = ""
+			}
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&corev1.Pod{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.CoreV1().Pods(namespace).List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.CoreV1().Pods(namespace).Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, ns, inf)
+			group.informers = append(group.informers, inf)
 		}
 	case gvk.Node:
-		if len(rw.config.Namespaces) == 0 && rw.config.Namespace == "" && len(factories) >= 1 {
-			// if no namespace is provided, the cluster wide informer factory, which is stored under the key "" is used to create the informer
-			if factory, ok := factories[metadata.ClusterWideInformerKey]; ok {
-				rw.setupInformer(kind, metadata.ClusterWideInformerKey, factory.Core().V1().Nodes().Informer())
-			}
+		// Nodes are cluster-scoped; only build when cluster-wide is selected.
+		if len(rw.config.Namespaces) == 0 && rw.config.Namespace == "" {
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&corev1.Node{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.CoreV1().Nodes().List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.CoreV1().Nodes().Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, metadata.ClusterWideInformerKey, inf)
+			group.informers = append(group.informers, inf)
 		}
 	case gvk.Namespace:
-		if len(rw.config.Namespaces) == 0 && rw.config.Namespace == "" && len(factories) >= 1 {
-			// if no namespace is provided, the cluster wide informer factory, which is stored under the key "" is used to create the informer
-			if factory, ok := factories[metadata.ClusterWideInformerKey]; ok {
-				rw.setupInformer(kind, metadata.ClusterWideInformerKey, factory.Core().V1().Namespaces().Informer())
-			}
+		if len(rw.config.Namespaces) == 0 && rw.config.Namespace == "" {
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&corev1.Namespace{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.CoreV1().Namespaces().List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.CoreV1().Namespaces().Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, metadata.ClusterWideInformerKey, inf)
+			group.informers = append(group.informers, inf)
 		}
 	case gvk.ReplicationController:
-		for ns, factory := range factories {
-			rw.setupInformer(kind, ns, factory.Core().V1().ReplicationControllers().Informer())
+		for _, ns := range namespaces {
+			namespace := ns
+			if namespace == metadata.ClusterWideInformerKey {
+				namespace = ""
+			}
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&corev1.ReplicationController{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.CoreV1().ReplicationControllers(namespace).List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.CoreV1().ReplicationControllers(namespace).Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, ns, inf)
+			group.informers = append(group.informers, inf)
 		}
 	case gvk.ResourceQuota:
-		for ns, factory := range factories {
-			rw.setupInformer(kind, ns, factory.Core().V1().ResourceQuotas().Informer())
+		for _, ns := range namespaces {
+			namespace := ns
+			if namespace == metadata.ClusterWideInformerKey {
+				namespace = ""
+			}
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&corev1.ResourceQuota{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.CoreV1().ResourceQuotas(namespace).List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.CoreV1().ResourceQuotas(namespace).Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, ns, inf)
+			group.informers = append(group.informers, inf)
 		}
 	case gvk.Service:
-		for ns, factory := range factories {
-			rw.setupInformer(kind, ns, factory.Core().V1().Services().Informer())
+		for _, ns := range namespaces {
+			namespace := ns
+			if namespace == metadata.ClusterWideInformerKey {
+				namespace = ""
+			}
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&corev1.Service{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.CoreV1().Services(namespace).List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.CoreV1().Services(namespace).Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, ns, inf)
+			group.informers = append(group.informers, inf)
 		}
 	case gvk.DaemonSet:
-		for ns, factory := range factories {
-			rw.setupInformer(kind, ns, factory.Apps().V1().DaemonSets().Informer())
+		for _, ns := range namespaces {
+			namespace := ns
+			if namespace == metadata.ClusterWideInformerKey {
+				namespace = ""
+			}
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&appsv1.DaemonSet{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.AppsV1().DaemonSets(namespace).List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.AppsV1().DaemonSets(namespace).Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, ns, inf)
+			group.informers = append(group.informers, inf)
 		}
 	case gvk.Deployment:
-		for ns, factory := range factories {
-			rw.setupInformer(kind, ns, factory.Apps().V1().Deployments().Informer())
+		for _, ns := range namespaces {
+			namespace := ns
+			if namespace == metadata.ClusterWideInformerKey {
+				namespace = ""
+			}
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&appsv1.Deployment{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.AppsV1().Deployments(namespace).List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.AppsV1().Deployments(namespace).Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, ns, inf)
+			group.informers = append(group.informers, inf)
 		}
 	case gvk.ReplicaSet:
-		for ns, factory := range factories {
-			rw.setupInformer(kind, ns, factory.Apps().V1().ReplicaSets().Informer())
+		for _, ns := range namespaces {
+			namespace := ns
+			if namespace == metadata.ClusterWideInformerKey {
+				namespace = ""
+			}
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&appsv1.ReplicaSet{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.AppsV1().ReplicaSets(namespace).List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.AppsV1().ReplicaSets(namespace).Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, ns, inf)
+			group.informers = append(group.informers, inf)
 		}
 	case gvk.StatefulSet:
-		for ns, factory := range factories {
-			rw.setupInformer(kind, ns, factory.Apps().V1().StatefulSets().Informer())
+		for _, ns := range namespaces {
+			namespace := ns
+			if namespace == metadata.ClusterWideInformerKey {
+				namespace = ""
+			}
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&appsv1.StatefulSet{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.AppsV1().StatefulSets(namespace).List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.AppsV1().StatefulSets(namespace).Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, ns, inf)
+			group.informers = append(group.informers, inf)
 		}
 	case gvk.Job:
-		for ns, factory := range factories {
-			rw.setupInformer(kind, ns, factory.Batch().V1().Jobs().Informer())
+		for _, ns := range namespaces {
+			namespace := ns
+			if namespace == metadata.ClusterWideInformerKey {
+				namespace = ""
+			}
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&batchv1.Job{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.BatchV1().Jobs(namespace).List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.BatchV1().Jobs(namespace).Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, ns, inf)
+			group.informers = append(group.informers, inf)
 		}
 	case gvk.CronJob:
-		for ns, factory := range factories {
-			rw.setupInformer(kind, ns, factory.Batch().V1().CronJobs().Informer())
+		for _, ns := range namespaces {
+			namespace := ns
+			if namespace == metadata.ClusterWideInformerKey {
+				namespace = ""
+			}
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&batchv1.CronJob{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.BatchV1().CronJobs(namespace).List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.BatchV1().CronJobs(namespace).Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, ns, inf)
+			group.informers = append(group.informers, inf)
 		}
 	case gvk.HorizontalPodAutoscaler:
-		for ns, factory := range factories {
-			rw.setupInformer(kind, ns, factory.Autoscaling().V2().HorizontalPodAutoscalers().Informer())
+		for _, ns := range namespaces {
+			namespace := ns
+			if namespace == metadata.ClusterWideInformerKey {
+				namespace = ""
+			}
+			inf := newShardedInformer(
+				sharding{shard: rw.config.Sharding.ShardInstanceID, totalShards: rw.config.Sharding.TotalShards},
+				&autoscalingv2.HorizontalPodAutoscaler{},
+				func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					return rw.client.AutoscalingV2().HorizontalPodAutoscalers(namespace).List(ctx, options)
+				},
+				func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					return rw.client.AutoscalingV2().HorizontalPodAutoscalers(namespace).Watch(ctx, options)
+				},
+				rw.config.MetadataCollectionInterval,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			rw.setupInformer(kind, ns, inf)
+			group.informers = append(group.informers, inf)
 		}
 	default:
 		rw.logger.Error("Could not setup an informer for provided group version kind",

@@ -19,6 +19,9 @@ type Config struct {
 
 	// Collection interval for metrics.
 	CollectionInterval time.Duration `mapstructure:"collection_interval"`
+	// Sharding controls how watchers filter objects. Objects are kept when
+	// xxhash64(uid) % total_shards == shard_instance_id.
+	Sharding ShardingConfig `mapstructure:"sharding"`
 
 	// Node condition types to report. See all condition types, see
 	// here: https://kubernetes.io/docs/concepts/architecture/nodes/#condition.
@@ -63,5 +66,28 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("\"%s\" is not a supported distribution. Must be one of: \"openshift\", \"kubernetes\"", cfg.Distribution)
 	}
 
+	// Sharding validation
+	if err := cfg.Sharding.Validate(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ShardingConfig defines the sharding behavior for resource watching.
+type ShardingConfig struct {
+	// ShardInstanceID is the 0-based shard index of this Collector instance.
+	ShardInstanceID uint64 `mapstructure:"shard_instance_id"`
+	// TotalShards is the total number of shards (must be >= 1).
+	TotalShards     uint64 `mapstructure:"total_shards"`
+}
+
+func (s *ShardingConfig) Validate() error {
+	if s.TotalShards < 1 {
+		return fmt.Errorf("total_shards must be >= 1")
+	}
+	if s.ShardInstanceID >= s.TotalShards {
+		return fmt.Errorf("shard_instance_id must be in [0, total_shards)")
+	}
 	return nil
 }
